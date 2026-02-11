@@ -42,7 +42,7 @@ uv pip install --system --upgrade --no-cache-dir --break-system-packages \
   jellyfish \
   beautifulsoup4 \
   yt-dlp \
-  beets \
+  "beets<2.6" \
   yq \
   pyxDamerauLevenshtein \
   pyacoustid \
