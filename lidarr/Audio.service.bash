@@ -1,5 +1,5 @@
 #!/usr/bin/with-contenv bash
-scriptVersion="2.50"
+scriptVersion="2.51"
 scriptName="Audio"
 
 ### Import Settings
@@ -2071,14 +2071,28 @@ except Exception:
         return prev[lb] / max(la, lb, 1)
 
 JUNK = re.compile(
-    r'[\(\[][^\)\]]*[\)\]]'
+    r'[\(\[][^\)\]]*[\)\]]'                       # (parentheticals) / [brackets]
+    r'|\bfeat(uring)?\b.*$'                        # "feat. X" and everything after
     r'|\b(official|officiel|video|videoclip|audio|lyrics?|lyric video|visuali[sz]er|'
-    r'hd|hq|4k|8k|mv|remaster(ed)?|explicit|clean|full album|topic)\b',
+    r'hd|hq|4k|8k|mv|remaster(ed)?|explicit|clean|full album|topic|from|the album)\b',
     re.I)
 
 def norm(s):
     s = JUNK.sub(' ', s or '')
     return re.sub(r'[^a-z0-9]+', ' ', s.lower()).strip()
+
+def toks(s):
+    return set(t for t in s.split() if t)
+
+def cover_dist(a, b):
+    # fraction of the SHORTER token set that is missing from the longer one.
+    # 0.0 == every word of the shorter title appears in the other.
+    sa, sb = toks(a), toks(b)
+    if not sa or not sb:
+        return 1.0
+    short = sa if len(sa) <= len(sb) else sb
+    other = sb if short is sa else sa
+    return len(short - other) / len(short)
 
 wt = norm(want_title)
 ar = norm(artist)
@@ -2099,7 +2113,12 @@ for e in (data.get('entries') or []):
     ch = norm(e.get('channel') or e.get('uploader') or '')
     cn = norm(ct)
     cn2 = re.sub(r'^' + re.escape(ar) + r'\s+', '', cn) if ar else cn
-    score = min(ndist(wt, cn), ndist(wt, cn2))
+    # title score: best of full edit distance and token coverage. Coverage gets
+    # a 0.15 floor so a shorter YouTube title that merely contains all the
+    # Lidarr words can't win outright -- the duration term decides between them.
+    tscore = min(ndist(wt, cn), ndist(wt, cn2),
+                 0.15 + cover_dist(wt, cn), 0.15 + cover_dist(wt, cn2))
+    score = tscore
     if want_dur and cd:
         dd = abs(cd - want_dur)
         score += 10.0 if dd > dur_tol else dd / (dur_tol * 4.0)
@@ -2177,7 +2196,7 @@ YoutubeSearch () {
 
 	log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube :: Matching $nTracks tracks song-by-song (title threshold $youtubeMatchThreshold, duration +-${youtubeDurationTolerance}s)..."
 
-	local matched=0 i=0 tLine tTitle tDurMs tDurS tNum tMed tClean qEnc searchFile best bId bDur bTitle outBase
+	local matched=0 i=0 tLine tTitle tDurMs tDurS tNum tMed tClean searchFile best bId bDur bTitle outBase
 	while IFS= read -r tLine; do
 		i=$(( i + 1 ))
 		tTitle="$(jq -r '.title // ""' <<<"$tLine")"
@@ -2194,33 +2213,35 @@ YoutubeSearch () {
 		fi
 
 		tClean="$(echo "$tTitle" | sed -e "s%[^[:alpha:][:digit:]]% %g" -e "s/  */ /g" | sed 's/^ *//g' | sed 's/ *$//g')"
-		qEnc="$(jq -R -r @uri <<<"${artistQuery} ${tClean}")"
 		searchFile="/config/extended/cache/youtube/${lidarrAlbumForeignAlbumId}-d${tMed}t${tNum}.json"
 
-		if [ ! -f "$searchFile" ]; then
-			timeout "$downloadClientTimeOut" yt-dlp -J --flat-playlist --no-warnings --geo-bypass \
-				"${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" \
-				"https://music.youtube.com/search?q=${qEnc}#Songs" \
-				> "$searchFile" 2>>"/config/logs/$logFileName" < /dev/null
-			sleep $sleepTimer
-		fi
-		if ! jq -e '((.entries // []) | length) > 0' >/dev/null 2>&1 < "$searchFile"; then
+		# Plain YouTube search -- flat results carry duration + channel, which the
+		# YT Music search tab does not. Try "<artist> <title>", then "<title>".
+		if [ ! -f "$searchFile" ] || ! jq -e '((.entries // []) | length) > 0' >/dev/null 2>&1 < "$searchFile"; then
 			timeout "$downloadClientTimeOut" yt-dlp -J --flat-playlist --no-warnings --geo-bypass \
 				"${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" \
 				"ytsearch${youtubeSearchResults}:${artistQuery} ${tClean}" \
 				> "$searchFile" 2>>"/config/logs/$logFileName" < /dev/null
 			sleep $sleepTimer
+			if [ -n "$artistQuery" ] && ! jq -e '((.entries // []) | length) > 0' >/dev/null 2>&1 < "$searchFile"; then
+				timeout "$downloadClientTimeOut" yt-dlp -J --flat-playlist --no-warnings --geo-bypass \
+					"${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" \
+					"ytsearch${youtubeSearchResults}:${tClean}" \
+					> "$searchFile" 2>>"/config/logs/$logFileName" < /dev/null
+				sleep $sleepTimer
+			fi
 		fi
 		if ! jq -e . >/dev/null 2>&1 < "$searchFile"; then
-			log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube :: track $i/$nTracks :: '$tTitle' :: no search results"
+			log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube :: track $i/$nTracks :: '$tTitle' :: no search results -- skipping YouTube for this album"
 			rm -f "$searchFile"
-			continue
+			break
 		fi
 
-		best="$(python "$scorer" "$tClean" "$tDurS" "$lidarrArtistNameSearchSanitized" "$youtubeMatchThreshold" "$youtubeDurationTolerance" < "$searchFile" 2>>"/config/logs/$logFileName")"
+		# pass the RAW Lidarr title so the scorer can strip "(...)" / "feat." itself
+		best="$(python "$scorer" "$tTitle" "$tDurS" "$lidarrArtistNameSearchSanitized" "$youtubeMatchThreshold" "$youtubeDurationTolerance" < "$searchFile" 2>>"/config/logs/$logFileName")"
 		if [ -z "$best" ]; then
-			log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube :: track $i/$nTracks :: '$tTitle' (${tDurS}s) :: NO acceptable match"
-			continue
+			log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube :: track $i/$nTracks :: '$tTitle' (${tDurS}s) :: NO acceptable match -- skipping YouTube for this album"
+			break
 		fi
 		bId="$(cut -f1 <<<"$best")"
 		bDur="$(cut -f2 <<<"$best")"
