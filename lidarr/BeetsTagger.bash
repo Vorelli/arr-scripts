@@ -36,7 +36,7 @@ getAlbumFolderName="$(basename "$getFolderPath")"
 
 log "Processing :: $getAlbumFolderName :: Processing Files..."
 
-if echo "$getFolderPath" | grep "$getAlbumArtistPath" | read; then
+if echo "$getFolderPath" | grep "$getAlbumArtistPath" | grep -q .; then
 	if [ ! -d "$getFolderPath" ]; then
 		log "ERROR :: \"$getFolderPath\" Folder is missing :: Exiting..."
 	fi
