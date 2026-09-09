@@ -1,5 +1,5 @@
 #!/usr/bin/with-contenv bash
-scriptVersion="2.51"
+scriptVersion="2.52"
 scriptName="Audio"
 
 ### Import Settings
@@ -93,6 +93,10 @@ verifyConfig () {
 
   if [ -z "$youtubeSearchResults" ]; then
     youtubeSearchResults="8"
+  fi
+
+  if [ -z "$youtubeYtdlpArgs" ]; then
+    youtubeYtdlpArgs=""
   fi
 
   audioPath="$downloadPath/audio"
@@ -323,22 +327,35 @@ DownloadClientYoutube () {
 	[ -n "$youtubeVpnProxy" ] && ytdlpProxyArgs=(--proxy "$youtubeVpnProxy")
 	ytdlpCookieArgs=()
 	[ -n "$youtubeCookiesFile" ] && ytdlpCookieArgs=(--cookies "$youtubeCookiesFile")
+	ytdlpExtraArgs=()
+	[ -n "$youtubeYtdlpArgs" ] && read -ra ytdlpExtraArgs <<< "$youtubeYtdlpArgs"
 	YtdlpFormatArgs
 
-	local ytId ytBase
+	local ytId ytBase rc consecFail=0
 	while IFS=$'\t' read -r ytId ytBase; do
 		[ -z "$ytId" ] && continue
 		if find "$audioPath/incomplete" -maxdepth 1 -type f -name "${ytBase}.*" | read; then
+			consecFail=0
 			continue   # already fetched on a previous attempt
 		fi
 		log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YOUTUBE :: Downloading $ytBase (yt:$ytId)"
 		timeout "$downloadClientTimeOut" yt-dlp \
 			-f "bestaudio/best" -x "${ytFmtArgs[@]}" \
 			--no-playlist --retries 4 --fragment-retries 4 --sleep-requests 1 \
-			"${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" \
+			"${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" "${ytdlpExtraArgs[@]}" \
 			--embed-metadata --embed-thumbnail --no-mtime --geo-bypass --no-warnings \
 			-o "$audioPath/incomplete/${ytBase}.%(ext)s" \
 			-- "$ytId" 2>&1 | tee -a "/config/logs/$logFileName"
+		rc=${PIPESTATUS[0]}
+		if [ "$rc" -ne 0 ] && ! find "$audioPath/incomplete" -maxdepth 1 -type f -name "${ytBase}.*" | read; then
+			consecFail=$(( consecFail + 1 ))
+			if [ "$consecFail" -ge 3 ]; then
+				log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YOUTUBE :: ERROR :: 3 consecutive yt-dlp failures (likely bot-check / IP block) -- aborting this album. Add authenticated cookies to /config/cookies.txt"
+				break
+			fi
+		else
+			consecFail=0
+		fi
 	done < "$matchFile"
 }
 
@@ -2027,7 +2044,11 @@ YoutubeClientSetup () {
 		log "YOUTUBE :: Cookies file found (/config/cookies.txt)"
 	else
 		youtubeCookiesFile=""
-		log "YOUTUBE :: No cookies file (optional). Add yt-dlp cookies to /config/cookies.txt for age/region-locked albums"
+		log "YOUTUBE :: No cookies file. YouTube blocks datacenter/VPN IPs with a bot check -- downloads will fail without authenticated cookies at /config/cookies.txt"
+	fi
+
+	if [ -n "$youtubeYtdlpArgs" ]; then
+		log "YOUTUBE :: Extra yt-dlp args: $youtubeYtdlpArgs"
 	fi
 
 	if [ -n "$youtubeVpnProxy" ]; then
@@ -2171,6 +2192,8 @@ YoutubeSearch () {
 	[ -n "$youtubeVpnProxy" ] && ytdlpProxyArgs=(--proxy "$youtubeVpnProxy")
 	ytdlpCookieArgs=()
 	[ -n "$youtubeCookiesFile" ] && ytdlpCookieArgs=(--cookies "$youtubeCookiesFile")
+	ytdlpExtraArgs=()
+	[ -n "$youtubeYtdlpArgs" ] && read -ra ytdlpExtraArgs <<< "$youtubeYtdlpArgs"
 
 	# Pull the album's track list (title + duration + numbers) from Lidarr
 	local tracksJson
@@ -2219,13 +2242,13 @@ YoutubeSearch () {
 		# YT Music search tab does not. Try "<artist> <title>", then "<title>".
 		if [ ! -f "$searchFile" ] || ! jq -e '((.entries // []) | length) > 0' >/dev/null 2>&1 < "$searchFile"; then
 			timeout "$downloadClientTimeOut" yt-dlp -J --flat-playlist --no-warnings --geo-bypass \
-				"${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" \
+				"${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" "${ytdlpExtraArgs[@]}" \
 				"ytsearch${youtubeSearchResults}:${artistQuery} ${tClean}" \
 				> "$searchFile" 2>>"/config/logs/$logFileName" < /dev/null
 			sleep $sleepTimer
 			if [ -n "$artistQuery" ] && ! jq -e '((.entries // []) | length) > 0' >/dev/null 2>&1 < "$searchFile"; then
 				timeout "$downloadClientTimeOut" yt-dlp -J --flat-playlist --no-warnings --geo-bypass \
-					"${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" \
+					"${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" "${ytdlpExtraArgs[@]}" \
 					"ytsearch${youtubeSearchResults}:${tClean}" \
 					> "$searchFile" 2>>"/config/logs/$logFileName" < /dev/null
 				sleep $sleepTimer
