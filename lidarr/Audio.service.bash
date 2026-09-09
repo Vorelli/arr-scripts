@@ -1,5 +1,5 @@
 #!/usr/bin/with-contenv bash
-scriptVersion="2.48"
+scriptVersion="2.49"
 scriptName="Audio"
 
 ### Import Settings
@@ -69,17 +69,68 @@ verifyConfig () {
 
   if [ -z "$preferSpecialEditions" ]; then
     preferSpecialEditions="true"
-  fi 
- 
+  fi
+
+  if [ -z "$retryNotFound" ]; then
+    retryNotFound="90"
+  fi
+
+  if [ -z "$youtubeVpnProxy" ]; then
+    youtubeVpnProxy=""
+  fi
+
+  if [ -z "$proxyAllDownloadClients" ]; then
+    proxyAllDownloadClients="false"
+  fi
+
   audioPath="$downloadPath/audio"
 
 
+}
+
+dlClientSetup () {
+	# Parse $dlClientSource (space/comma separated list) into the ordered,
+	# de-duplicated dlClients[] array.
+	#   valid clients: deezer tidal youtube
+	#   "both" is still accepted and expands to "deezer tidal"
+	local raw c seen
+	local -a out
+	raw="${dlClientSource,,}"
+	raw="${raw//,/ }"
+	dlClients=()
+	for c in $raw; do
+		case "$c" in
+			both)                 dlClients+=("deezer" "tidal") ;;
+			deezer|tidal|youtube) dlClients+=("$c") ;;
+			"")                   : ;;
+			*) log "WARNING :: dlClientSource :: unknown client \"$c\" (valid: deezer tidal youtube both) -- ignoring" ;;
+		esac
+	done
+	seen=" "
+	out=()
+	for c in "${dlClients[@]}"; do
+		case "$seen" in
+			*" $c "*) continue ;;
+		esac
+		out+=("$c")
+		seen="$seen$c "
+	done
+	dlClients=("${out[@]}")
+}
+
+clientEnabled () {
+	local c
+	for c in "${dlClients[@]}"; do
+		[ "$c" == "$1" ] && return 0
+	done
+	return 1
 }
 
 Configuration () {
 	sleepTimer=0.5
 	tidaldlFail=0
 	deemixFail=0
+	youtubedlFail=0
 	log "-----------------------------------------------------------------------------"
 	log " |~) _ ._  _| _ ._ _ |\ |o._  o _ |~|_|_|"
 	log " |~\(_|| |(_|(_)| | || \||| |_|(_||~| | |<"
@@ -191,15 +242,83 @@ Configuration () {
 	fi
 
  	log "Failed Download Attempt Threshold: $failedDownloadAttemptThreshold"
-	
+
+	dlClientSetup
+	NotFoundMigration
+	if [ ${#dlClients[@]} -eq 0 ]; then
+		log "ERROR :: No valid dlClientSource set (got: \"$dlClientSource\")"
+		log "ERROR :: Set dlClientSource to any of: deezer tidal youtube both (space or comma separated)"
+		NotifyWebhook "FatalError" "No valid dlClientSource set"
+		log "Script sleeping for $audioScriptInterval..."
+		sleep $audioScriptInterval
+		exit
+	fi
+	log "Download Client(s): ${dlClients[*]}"
+
+}
+
+ProxyOn () {
+	# Opt-in: route the heavy download clients (deemix/freyr/tidal-dl) through
+	# the same VPN proxy as yt-dlp. Off by default -- deezer/tidal are API-key
+	# authed and work fine direct. yt-dlp is always proxied via its own --proxy
+	# flag, never through these env vars. Metadata/API curl calls are never
+	# wrapped, so they stay direct regardless.
+	if [ "$proxyAllDownloadClients" == "true" ] && [ -n "$youtubeVpnProxy" ]; then
+		export HTTP_PROXY="$youtubeVpnProxy" HTTPS_PROXY="$youtubeVpnProxy" http_proxy="$youtubeVpnProxy" https_proxy="$youtubeVpnProxy"
+	fi
+}
+
+ProxyOff () {
+	unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 }
 
 DownloadClientFreyr () {
+	ProxyOn
 	timeout $downloadClientTimeOut freyr --no-bar --no-net-check -d $audioPath/incomplete deezer:album:$1 2>&1 | tee -a "/config/logs/$logFileName"
+	ProxyOff
  	# Resolve issue 94
  	if [ -d /root/.cache/FreyrCLI ]; then
   		rm -rf  /root/.cache/FreyrCLI/*
         fi
+}
+
+DownloadClientYoutube () {
+	# $1 = YouTube Music playlist/browse id (OLAK5uy_.. / MPREb_..) or full URL
+	local ytUrl
+	case "$1" in
+		http*)      ytUrl="$1" ;;
+		MPRE*)      ytUrl="https://music.youtube.com/browse/$1" ;;
+		OLAK5uy_*)  ytUrl="https://music.youtube.com/playlist?list=$1" ;;
+		*)          ytUrl="https://music.youtube.com/playlist?list=$1" ;;
+	esac
+
+	ytdlpProxyArgs=()
+	[ -n "$youtubeVpnProxy" ] && ytdlpProxyArgs=(--proxy "$youtubeVpnProxy")
+	ytdlpCookieArgs=()
+	[ -n "$youtubeCookiesFile" ] && ytdlpCookieArgs=(--cookies "$youtubeCookiesFile")
+
+	# Honour the configured output format directly -- yt-dlp can only extract
+	# FROM its download, and the flac->X transcode step further down never sees
+	# YouTube's opus/m4a. "native" keeps the best available lossy codec.
+	local ytFmtArgs
+	case "$audioFormat" in
+		native) ytFmtArgs=(--audio-quality 0) ;;
+		mp3)    ytFmtArgs=(--audio-format mp3  --audio-quality "${audioBitrate}k") ;;
+		aac)    ytFmtArgs=(--audio-format aac  --audio-quality "${audioBitrate}k") ;;
+		opus)   ytFmtArgs=(--audio-format opus --audio-quality "${audioBitrate}k") ;;
+		alac)   ytFmtArgs=(--audio-format alac) ;;
+		*)      ytFmtArgs=(--audio-quality 0) ;;
+	esac
+
+	timeout "$downloadClientTimeOut" yt-dlp \
+		-f "bestaudio/best" -x "${ytFmtArgs[@]}" \
+		--yes-playlist --ignore-errors --no-abort-on-error \
+		--retries 4 --fragment-retries 4 --sleep-requests 1 \
+		"${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" \
+		--embed-metadata --embed-thumbnail --no-mtime --geo-bypass --no-warnings \
+		--parse-metadata "playlist_index:%(track_number)s" \
+		-o "$audioPath/incomplete/%(playlist_index)02d - %(title)s.%(ext)s" \
+		"$ytUrl" 2>&1 | tee -a "/config/logs/$logFileName"
 }
 
 DownloadFormat () {
@@ -289,15 +408,70 @@ DownloadFolderCleaner () {
 }
 
 NotFoundFolderCleaner () {
-	# check for completed download folder
+	if [ -z "$retryNotFound" ]; then retryNotFound="90"; fi
 	if [ -d /config/extended/logs/notfound ]; then
-		# check for notfound entries older than X days
-		if find /config/extended/logs/notfound -mindepth 1 -type f -mtime +$retryNotFound | read; then
-			log "Removing prevously notfound lidarr album ids older than $retryNotFound days to give them a retry..."
-			# delete ntofound entries older than X days
-			find /config/extended/logs/notfound -mindepth 1 -type f -mtime +$retryNotFound -delete
+		# Per-client markers: <albumId>--<artistMBID>--<albumMBID>--<client>
+		# Deleting one client's marker re-opens only that client for the album.
+		if find /config/extended/logs/notfound -mindepth 1 -type f -name '*--*--*--*' -mtime +$retryNotFound | read; then
+			log "Removing per-client notfound markers older than $retryNotFound days to give them a retry..."
+			find /config/extended/logs/notfound -mindepth 1 -type f -name '*--*--*--*' -mtime +$retryNotFound -delete
+		fi
+		# Legacy suffix-less markers that escaped NotFoundMigration
+		if find /config/extended/logs/notfound -mindepth 1 -type f ! -name '*--*--*--*' -mtime +$retryNotFound | read; then
+			log "Removing legacy notfound markers older than $retryNotFound days..."
+			find /config/extended/logs/notfound -mindepth 1 -type f ! -name '*--*--*--*' -mtime +$retryNotFound -delete
 		fi
 	fi
+}
+
+NotFoundMigration () {
+	# One-time: convert pre-2.49 album-level markers (<id>--<aMBID>--<albMBID>)
+	# into per-client markers. Only deezer/tidal could have produced them, so a
+	# newly-added youtube client still gets a fresh attempt at those albums.
+	local dir="/config/extended/logs/notfound"
+	[ -d "$dir" ] || return
+	local f base migrated=0
+	for f in "$dir"/*; do
+		[ -f "$f" ] || continue
+		base="$(basename "$f")"
+		case "$base" in
+			*--deezer|*--tidal|*--youtube) continue ;;
+		esac
+		if [[ "$base" == *--*--* ]]; then
+			touch "$dir/$base--deezer" "$dir/$base--tidal"
+			chmod 777 "$dir/$base--deezer" "$dir/$base--tidal" 2>/dev/null
+			rm -f "$f"
+			migrated=$(( migrated + 1 ))
+		fi
+	done
+	[ "$migrated" -gt 0 ] && log "NOTFOUND MIGRATION :: Converted $migrated legacy marker(s) to --deezer + --tidal"
+}
+
+BuildNotFoundExhaustedList () {
+	# $1 = output file. Writes the sorted-unique list of lidarr album IDs that
+	# have a notfound marker for EVERY client in dlClients[] (fully exhausted).
+	# Empty dlClients[] -> empty output (nothing is excluded).
+	local outFile="$1"
+	local markerDir="/config/extended/logs/notfound"
+	local accFile="/config/extended/cache/nf-exhausted-acc.txt"
+	local curFile="/config/extended/cache/nf-exhausted-cur.txt"
+	: > "$outFile"
+	[ ${#dlClients[@]} -eq 0 ] && return
+	mkdir -p "$markerDir"
+	local client first="true"
+	: > "$accFile"
+	for client in "${dlClients[@]}"; do
+		ls -1 "$markerDir"/ 2>/dev/null | grep -E -- "--${client}\$" | sed -E 's/--.*//' | sort -u > "$curFile"
+		if [ "$first" == "true" ]; then
+			cp "$curFile" "$accFile"
+			first="false"
+		else
+			comm -12 "$accFile" "$curFile" > "$accFile.next"
+			mv "$accFile.next" "$accFile"
+		fi
+	done
+	sort -u "$accFile" > "$outFile"
+	rm -f "$accFile" "$accFile.next" "$curFile"
 }
 
 TidalClientSetup () {
@@ -455,6 +629,16 @@ DownloadProcess () {
 		chmod 777 /config/extended/logs/downloaded/failed/tidal
 	fi
 
+	if [ ! -d /config/extended/logs/downloaded/youtube ]; then
+		mkdir -p /config/extended/logs/downloaded/youtube
+		chmod 777 /config/extended/logs/downloaded/youtube
+	fi
+
+	if [ ! -d /config/extended/logs/downloaded/failed/youtube ]; then
+		mkdir -p /config/extended/logs/downloaded/failed/youtube
+		chmod 777 /config/extended/logs/downloaded/failed/youtube
+	fi
+
 	if [ ! -d "$importPath" ]; then
 		mkdir -p "$importPath"
 		chmod 777 "$importPath"
@@ -493,8 +677,20 @@ DownloadProcess () {
 		fi
 	fi
 
-	
-	
+	# check for log file
+	if [ "$2" == "YOUTUBE" ]; then
+		if [ -f /config/extended/logs/downloaded/youtube/$1 ]; then
+			log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: ERROR :: Previously Downloaded ($1)..."
+			return
+		fi
+		if [ -f /config/extended/logs/downloaded/failed/youtube/$1 ]; then
+			log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: ERROR :: Previously Attempted Download ($1)..."
+			return
+		fi
+	fi
+
+
+
 	downloadTry=0
 	until false
 	do	
@@ -508,13 +704,15 @@ DownloadProcess () {
 
 		log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Download Attempt number $downloadTry"
 		if [ "$2" == "DEEZER" ]; then
-			
+
 			if [ -z $arlToken ]; then
 				DownloadClientFreyr $1
 			else
+				ProxyOn
 				deemix -b $deemixQuality -p "$audioPath"/incomplete "https://www.deezer.com/album/$1" 2>&1 | tee -a "/config/logs/$logFileName"
+				ProxyOff
 			fi
-			
+
 			if [ -d "/tmp/deemix-imgs" ]; then
 				rm -rf /tmp/deemix-imgs
 			fi
@@ -549,7 +747,9 @@ DownloadProcess () {
 				if [ -z $arlToken ]; then
 					DownloadClientFreyr $1
 				else
+					ProxyOn
 					deemix -b $deemixQuality -p "$audioPath"/incomplete "https://www.deezer.com/album/$1" 2>&1 | tee -a "/config/logs/$logFileName"
+					ProxyOff
 				fi
     			fi
        		fi
@@ -557,7 +757,9 @@ DownloadProcess () {
 		if [ "$2" == "TIDAL" ]; then
 			TidaldlStatusCheck
 
+			ProxyOn
 			tidal-dl -q $tidalQuality -o "$audioPath/incomplete" -l "$1"  2>&1 | tee -a "/config/logs/$logFileName"
+			ProxyOff
 
 			# Verify Client Works...
 			clientTestDlCount=$(find "$audioPath"/incomplete/ -type f -regex ".*/.*\.\(flac\|opus\|m4a\|mp3\)" | wc -l)
@@ -578,6 +780,24 @@ DownloadProcess () {
 			fi
 		fi
 
+		if [ "$2" == "YOUTUBE" ]; then
+			DownloadClientYoutube "$1"
+
+			# Verify Client Works... (YouTube audio is opus/m4a, not flac)
+			clientTestDlCount=$(find "$audioPath"/incomplete/ -type f -regex ".*/.*\.\(flac\|opus\|ogg\|m4a\|mp3\)" | wc -l)
+			if [ $clientTestDlCount -le 0 ]; then
+				youtubedlFail=$(( $youtubedlFail + 1))
+			else
+				youtubedlFail=0
+			fi
+
+			# yt-dlp has no auth to verify -- just count failed attempts
+			if [ $youtubedlFail -ge $failedDownloadAttemptThreshold ]; then
+				log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: All $failedDownloadAttemptThreshold Download Attempts failed, skipping..."
+				youtubedlFail=0
+			fi
+		fi
+
 		find "$audioPath/incomplete" -type f -iname "*.flac" -newer "/temp-download" -print0 | while IFS= read -r -d '' file; do
 			audioFlacVerification "$file"
 			if [ "$verifiedFlacFile" == "0" ]; then
@@ -588,7 +808,7 @@ DownloadProcess () {
 			fi
 		done
 
-		downloadCount=$(find "$audioPath"/incomplete/ -type f -regex ".*/.*\.\(flac\|m4a\|mp3\)" | wc -l)
+		downloadCount=$(find "$audioPath"/incomplete/ -type f -regex ".*/.*\.\(flac\|opus\|ogg\|m4a\|mp3\)" | wc -l)
 		if [ "$downloadCount" -ne "$5" ]; then
 			log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: ERROR :: download failed, missing tracks..."
 			completedVerification="false"
@@ -615,13 +835,13 @@ DownloadProcess () {
 	find "$audioPath/incomplete" -type f -exec mv "{}" "$audioPath"/incomplete/ \; 2>/dev/null
 	find $audioPath/incomplete/ -type d -mindepth 1 -maxdepth 1 -exec rm -rf {} \; 2>/dev/null
 
-	downloadCount=$(find "$audioPath"/incomplete/ -type f -regex ".*/.*\.\(flac\|m4a\|mp3\)" | wc -l)
+	downloadCount=$(find "$audioPath"/incomplete/ -type f -regex ".*/.*\.\(flac\|opus\|ogg\|m4a\|mp3\)" | wc -l)
 	if [ "$downloadCount" -gt "0" ]; then
 		# Check download for required quality (checks based on file extension)
 		DownloadQualityCheck "$audioPath/incomplete" "$2"
 	fi
 	
-	downloadCount=$(find "$audioPath"/incomplete/ -type f -regex ".*/.*\.\(flac\|m4a\|mp3\)" | wc -l)
+	downloadCount=$(find "$audioPath"/incomplete/ -type f -regex ".*/.*\.\(flac\|opus\|ogg\|m4a\|mp3\)" | wc -l)
 	if [ "$downloadCount" -ne "$5" ]; then
 		log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: ERROR :: All download Attempts failed..."
 		log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Logging $1 as failed download..."
@@ -633,6 +853,9 @@ DownloadProcess () {
 		if [ "$2" == "TIDAL" ]; then
 			touch /config/extended/logs/downloaded/failed/tidal/$1
 		fi
+		if [ "$2" == "YOUTUBE" ]; then
+			touch /config/extended/logs/downloaded/failed/youtube/$1
+		fi
 		return
 	fi
 
@@ -643,6 +866,9 @@ DownloadProcess () {
 	fi
 	if [ "$2" == "TIDAL" ]; then
 		touch /config/extended/logs/downloaded/tidal/$1
+	fi
+	if [ "$2" == "YOUTUBE" ]; then
+		touch /config/extended/logs/downloaded/youtube/$1
 	fi
 
 	# Tag with beets
@@ -845,6 +1071,15 @@ ProcessWithBeets () {
 
 DownloadQualityCheck () {
 
+	# YouTube audio is always lossy (opus/m4a). When a non-native output format
+	# is configured the transcode step (further down in DownloadProcess) will
+	# normalise it, so the pre-transcode check here would wrongly delete the
+	# just-downloaded files -- skip it for YouTube in that case.
+	if [ "$2" == "YOUTUBE" ] && [ "$audioFormat" != "native" ]; then
+		log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Skipping pre-transcode quality check for YouTube (transcode step normalises format)..."
+		return
+	fi
+
 	if [ "$requireQuality" == "true" ]; then
 		log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Checking for unwanted files"
 
@@ -884,6 +1119,15 @@ DownloadQualityCheck () {
 				fi
 			elif [ "$2" == "TIDAL" ]; then
 				if find "$1" -type f -regex ".*/.*\.\(opus\|flac\|mp3\)"| read; then
+					log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Unwanted files found!"
+					log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Performing cleanup..."
+					rm "$1"/*
+				else
+					log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: No unwanted files found!"
+				fi
+			elif [ "$2" == "YOUTUBE" ]; then
+				# native + high/low: keep the lossy YouTube audio, only reject flac
+				if find "$1" -type f -regex ".*/.*\.\(flac\)"| read; then
 					log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Unwanted files found!"
 					log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Performing cleanup..."
 					rm "$1"/*
@@ -1040,15 +1284,13 @@ GetMissingCutOffList () {
 			fi
 			log "$page :: missing :: Downloading page $page... ($offset - $dlnumber of $lidarrMissingTotalRecords Results)"
       wget --timeout=0 -q -O - "$arrUrl/api/v1/wanted/missing?page=$page&pagesize=$amountPerPull&sortKey=$searchOrder&sortDirection=$searchDirection&apikey=${arrApiKey}" | jq -r '.records[].id' | sort > /config/extended/cache/tocheck.txt
-			log "$page :: missing :: Filtering Album IDs by removing previously searched Album IDs (/config/extended/logs/notfound/<files>)"
-      ls /config/extended/logs/notfound/ | sed "s/--.*//" > /config/extended/cache/notfound.txt
+			log "$page :: missing :: Filtering out albums already not found on ALL configured clients (${dlClients[*]})"
+			BuildNotFoundExhaustedList /config/extended/cache/notfound.txt
 
-      for lidarrRecordId in $(comm -13 /config/extended/cache/notfound.txt /config/extended/cache/tocheck.txt); do
-				if [ ! -f /config/extended/logs/notfound/$lidarrRecordId--* ]; then
-					touch "/config/extended/cache/lidarr/list/${lidarrRecordId}-missing"
-				fi
+			for lidarrRecordId in $(comm -13 /config/extended/cache/notfound.txt /config/extended/cache/tocheck.txt); do
+				touch "/config/extended/cache/lidarr/list/${lidarrRecordId}-missing"
 			done
-      rm /config/extended/cache/notfound.txt /config/extended/cache/tocheck.txt
+			rm /config/extended/cache/notfound.txt /config/extended/cache/tocheck.txt
 			
 			lidarrMissingRecords=$(ls /config/extended/cache/lidarr/list 2>/dev/null | wc -l)
 			log "$page :: missing :: ${lidarrMissingRecords} albums found to process!"
@@ -1083,15 +1325,13 @@ GetMissingCutOffList () {
 			# lidarrRecords=$(wget --timeout=0 -q -O - "$arrUrl/api/v1/wanted/cutoff?page=$page&pagesize=$amountPerPull&sortKey=$searchOrder&sortDirection=$searchDirection&apikey=${arrApiKey}" | jq -r '.records[].id')
       wget --timeout=0 -q -O - "$arrUrl/api/v1/wanted/cutoff?page=$page&pagesize=$amountPerPull&sortKey=$searchOrder&sortDirection=$searchDirection&apikey=${arrApiKey}" | jq -r '.records[].id' | sort > /config/extended/cache/tocheck.txt
 
-			log "$page :: cutoff :: Filtering Album IDs by removing previously searched Album IDs (/config/extended/logs/notfound/<files>)"
-			ls /config/extended/logs/notfound/ | sed "s/--.*//" > /config/extended/cache/notfound.txt
+			log "$page :: cutoff :: Filtering out albums already not found on ALL configured clients (${dlClients[*]})"
+			BuildNotFoundExhaustedList /config/extended/cache/notfound.txt
 
-      for lidarrRecordId in $(comm -13 /config/extended/cache/notfound.txt /config/extended/cache/tocheck.txt); do
-				if [ ! -f /config/extended/logs/notfound/$lidarrRecordId--* ]; then
-					touch /config/extended/cache/lidarr/list/${lidarrRecordId}-cutoff
-				fi
+			for lidarrRecordId in $(comm -13 /config/extended/cache/notfound.txt /config/extended/cache/tocheck.txt); do
+				touch /config/extended/cache/lidarr/list/${lidarrRecordId}-cutoff
 			done
-      rm /config/extended/cache/notfound.txt /config/extended/cache/tocheck.txt
+			rm /config/extended/cache/notfound.txt /config/extended/cache/tocheck.txt
 
 			lidarrCutoffRecords=$(ls /config/extended/cache/lidarr/list/*-cutoff 2>/dev/null | wc -l)
 			log "$page :: cutoff :: ${lidarrCutoffRecords} albums found to process!"
@@ -1130,8 +1370,25 @@ SearchProcess () {
 		
 		LidarrTaskStatusCheck
 				
-		if [ -f "/config/extended/logs/notfound/$wantedAlbumId--$lidarrArtistForeignArtistId--$lidarrAlbumForeignAlbumId" ]; then
-			log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $wantedAlbumListSource :: $lidarrAlbumType :: $wantedAlbumListSource :: $lidarrArtistName :: $lidarrAlbumTitle :: Previously Not Found, skipping..."
+		notFoundBase="/config/extended/logs/notfound/$wantedAlbumId--$lidarrArtistForeignArtistId--$lidarrAlbumForeignAlbumId"
+
+		# Migrate any legacy (pre-2.49) suffix-less marker for this album
+		if [ -f "$notFoundBase" ]; then
+			for _c in deezer tidal; do
+				touch "$notFoundBase--$_c"
+				chmod 777 "$notFoundBase--$_c" 2>/dev/null
+			done
+			rm -f "$notFoundBase"
+		fi
+
+		# Which configured clients still need to try this album?
+		albumClients=()
+		for _c in "${dlClients[@]}"; do
+			[ -f "$notFoundBase--$_c" ] && continue
+			albumClients+=("$_c")
+		done
+		if [ ${#albumClients[@]} -eq 0 ]; then
+			log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Previously Not Found on all configured clients (${dlClients[*]}), skipping..."
 			continue
 		fi
 
@@ -1151,10 +1408,13 @@ SearchProcess () {
 		fi
 		
 		if [ -f "/config/extended/logs/downloaded/notfound/$lidarrAlbumForeignAlbumId" ]; then
-			log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrAlbumTitle :: $lidarrAlbumType :: Previously Not Found, skipping..."
+			log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrAlbumTitle :: $lidarrAlbumType :: Previously Not Found (metadata match), skipping..."
 			rm "/config/extended/logs/downloaded/notfound/$lidarrAlbumForeignAlbumId"
-			touch "/config/extended/logs/notfound/$wantedAlbumId--$lidarrArtistForeignArtistId--$lidarrAlbumForeignAlbumId"
-			chmod 777 "/config/extended/logs/notfound/$wantedAlbumId--$lidarrArtistForeignArtistId--$lidarrAlbumForeignAlbumId"
+			# MusicBrainz-level "no match" -> mark every configured client exhausted
+			for _c in "${dlClients[@]}"; do
+				touch "$notFoundBase--$_c"
+				chmod 777 "$notFoundBase--$_c" 2>/dev/null
+			done
 			continue
 		fi
 
@@ -1202,20 +1462,21 @@ SearchProcess () {
 			continue
 		fi
 
-		if [ "$dlClientSource" == "deezer" ]; then
-			skipTidal=true
-			skipDeezer=false
+		# Only try clients that are configured AND haven't already failed this
+		# album (per-client notfound marker). albumClients[] was built above.
+		skipDeezer=true
+		skipTidal=true
+		skipYoutube=true
+		for _c in "${albumClients[@]}"; do
+			case "$_c" in
+				deezer)  skipDeezer=false ;;
+				tidal)   skipTidal=false ;;
+				youtube) skipYoutube=false ;;
+			esac
+		done
+		if [ "$youtubeClientEnabled" != "true" ]; then
+			skipYoutube=true
 		fi
-
-		if [ "$dlClientSource" == "tidal" ]; then
-			skipDeezer=true
-			skipTidal=false
-		fi
-
-		if [ "$dlClientSource" == "both" ]; then
-			skipDeezer=false
-			skipTidal=false
-		fi	
 
 		if [ "$skipDeezer" == "false" ]; then
 
@@ -1335,7 +1596,7 @@ SearchProcess () {
 					
 					# Tidal Artist search
 					if [ "$lidarrDownloadImportNotfication" == "false" ]; then
-						if [ "$dlClientSource" == "both" ] || [ "$dlClientSource" == "tidal" ]; then
+						if [ "$skipTidal" == "false" ]; then
 							for tidalArtistId in $(echo $tidalArtistIds); do
 								ArtistTidalSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$tidalArtistId" "$lyricFilter"
 								sleep 0.01
@@ -1347,7 +1608,7 @@ SearchProcess () {
 
 					# Deezer artist search
 					if [ "$lidarrDownloadImportNotfication" == "false" ]; then
-						if [ "$dlClientSource" == "both" ] || [ "$dlClientSource" == "deezer" ]; then
+						if [ "$skipDeezer" == "false" ]; then
 							for dId in ${!deezerArtistIds[@]}; do
 								deezerArtistId="${deezerArtistIds[$dId]}"
 								ArtistDeezerSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$deezerArtistId" "$lyricFilter"
@@ -1356,11 +1617,11 @@ SearchProcess () {
 						fi
 					fi
 				fi
-				
+
 				#log "3 : $lidarrDownloadImportNotfication"
 				# Tidal fuzzy search
 				if [ "$lidarrDownloadImportNotfication" == "false" ]; then
-					if [ "$dlClientSource" == "both" ] || [ "$dlClientSource" == "tidal" ]; then
+					if [ "$skipTidal" == "false" ]; then
 						FuzzyTidalSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$lyricFilter"
 						sleep 0.01
 					fi
@@ -1369,8 +1630,17 @@ SearchProcess () {
 				#log "4 : $lidarrDownloadImportNotfication"
 				# Deezer fuzzy search
 				if [ "$lidarrDownloadImportNotfication" == "false" ]; then
-					if [ "$dlClientSource" == "both" ] || [ "$dlClientSource" == "deezer" ]; then
+					if [ "$skipDeezer" == "false" ]; then
 						FuzzyDeezerSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$lyricFilter"
+						sleep 0.01
+					fi
+				fi
+
+				#log "5 : $lidarrDownloadImportNotfication"
+				# YouTube (YouTube Music) search -- one pass only, no lyric filter
+				if [ "$lidarrDownloadImportNotfication" == "false" ] && [ "$loopCount" == "1" ]; then
+					if [ "$skipYoutube" == "false" ]; then
+						YoutubeSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal"
 						sleep 0.01
 					fi
 				fi
@@ -1390,11 +1660,13 @@ SearchProcess () {
 			if [ "$loopCount" == "$endLoop" ]; then
 				log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Album Not found"
 				if [ "$skipNotFoundLogCreation" == "false" ]; then
-					log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Marking Album as notfound"
-					if [ ! -f "/config/extended/logs/notfound/$wantedAlbumId--$lidarrArtistForeignArtistId--$lidarrAlbumForeignAlbumId" ]; then
-						touch "/config/extended/logs/notfound/$wantedAlbumId--$lidarrArtistForeignArtistId--$lidarrAlbumForeignAlbumId"
-						chmod 777 "/config/extended/logs/notfound/$wantedAlbumId--$lidarrArtistForeignArtistId--$lidarrAlbumForeignAlbumId"
-					fi
+					log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Marking album as notfound for client(s): ${albumClients[*]}"
+					for _c in "${albumClients[@]}"; do
+						if [ ! -f "$notFoundBase--$_c" ]; then
+							touch "$notFoundBase--$_c"
+							chmod 777 "$notFoundBase--$_c" 2>/dev/null
+						fi
+					done
 				else
 					log "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Skip marking album as not found because it's a new release for 7 days..."
 				fi
@@ -1716,7 +1988,153 @@ FuzzyTidalSearch () {
 		log "$1 :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Fuzzy Search :: Tidal :: $type :: $lidarrReleaseTitle :: ERROR :: Albums found, but none matching search criteria..."
 	else
 		log "$1 :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: Fuzzy Search :: Tidal :: $type :: $lidarrReleaseTitle :: ERROR :: No results found..."
-	fi	
+	fi
+}
+
+YoutubeClientSetup () {
+	log "YOUTUBE :: Verifying yt-dlp configuration"
+	if ! command -v yt-dlp >/dev/null 2>&1; then
+		log "YOUTUBE :: ERROR :: yt-dlp not found in container -- youtube client will be skipped this run"
+		youtubeClientEnabled="false"
+		return
+	fi
+	youtubeClientEnabled="true"
+	log "YOUTUBE :: yt-dlp version: $(yt-dlp --version 2>/dev/null)"
+
+	if [ -f /config/cookies.txt ]; then
+		youtubeCookiesFile="/config/cookies.txt"
+		log "YOUTUBE :: Cookies file found (/config/cookies.txt)"
+	else
+		youtubeCookiesFile=""
+		log "YOUTUBE :: No cookies file (optional). Add yt-dlp cookies to /config/cookies.txt for age/region-locked albums"
+	fi
+
+	if [ -n "$youtubeVpnProxy" ]; then
+		log "YOUTUBE :: Proxy: $youtubeVpnProxy"
+	else
+		log "YOUTUBE :: Proxy: disabled (set youtubeVpnProxy in extended.conf to tunnel yt-dlp through a VPN)"
+	fi
+
+	mkdir -p /config/extended/cache/youtube
+	chmod 777 /config/extended/cache/youtube
+	log "YOUTUBE :: Purging album search cache..."
+	rm /config/extended/cache/youtube/*-albums.json &>/dev/null
+
+	if [ ! -d "$audioPath/incomplete" ]; then
+		mkdir -p "$audioPath"/incomplete
+		chmod 777 "$audioPath"/incomplete
+	fi
+}
+
+YoutubeSearch () {
+	# Required Inputs
+	# $1 Process ID prefix
+	# Resolves the current album to a YouTube Music album playlist and hands it
+	# to DownloadProcess. One pass, no explicit/clean lyric distinction.
+
+	if [ "$youtubeClientEnabled" != "true" ]; then
+		return
+	fi
+
+	local proc="$1"
+
+	# YouTube audio is always lossy -- a lossless/master requirement rejects
+	# every result, so skip before wasting a search + download.
+	if [ "$requireQuality" == "true" ] && [ "$audioFormat" == "native" ] && { [ "$audioBitrate" == "master" ] || [ "$audioBitrate" == "lossless" ]; }; then
+		log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube Search :: WARNING :: requireQuality + audioBitrate=$audioBitrate rejects all lossy YouTube audio -- skipping YouTube for this album"
+		return
+	fi
+
+	if [ ! -d /config/extended/cache/youtube ]; then
+		mkdir -p /config/extended/cache/youtube
+		chmod 777 /config/extended/cache/youtube
+	fi
+
+	ytdlpProxyArgs=()
+	[ -n "$youtubeVpnProxy" ] && ytdlpProxyArgs=(--proxy "$youtubeVpnProxy")
+	ytdlpCookieArgs=()
+	[ -n "$youtubeCookiesFile" ] && ytdlpCookieArgs=(--cookies "$youtubeCookiesFile")
+
+	local queryRaw
+	if [ "$lidarrArtistForeignArtistId" == "89ad4ac3-39f7-470e-963a-56509c546377" ]; then
+		queryRaw="$lidarrAlbumReleaseTitleSearchClean"
+	else
+		queryRaw="$lidarrArtistNameSearchSanitized $lidarrAlbumReleaseTitleSearchClean"
+	fi
+	local queryEnc
+	queryEnc="$(jq -R -r @uri <<<"$queryRaw")"
+	local cacheKey
+	cacheKey="$(echo "${lidarrAlbumReleaseTitleClean,,}" | sed 's/[^a-z0-9]//g' | cut -c1-24)"
+	local cacheFile="/config/extended/cache/youtube/${lidarrAlbumForeignAlbumId}-${cacheKey}-albums.json"
+
+	log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube Search :: $lidarrReleaseTitle :: Searching... (Track Count: $lidarrAlbumReleasesMinTrackCount-$lidarrAlbumReleasesMaxTrackCount)"
+
+	if [ ! -f "$cacheFile" ]; then
+		timeout "$downloadClientTimeOut" yt-dlp -J --flat-playlist --no-warnings --geo-bypass \
+			"${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" \
+			"https://music.youtube.com/search?q=${queryEnc}#Albums" \
+			> "$cacheFile" 2>>"/config/logs/$logFileName"
+		sleep $sleepTimer
+	fi
+	if ! jq -e . >/dev/null 2>&1 < "$cacheFile"; then
+		log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube Search :: $lidarrReleaseTitle :: ERROR :: No/invalid search results"
+		rm -f "$cacheFile"
+		return
+	fi
+
+	local candidates
+	candidates="$(jq -c '.entries[]? // empty | {id: (.id // .playlist_id // ""), url: (.url // ""), title: (.title // ""), count: (.playlist_count // .n_entries // 0)}' "$cacheFile" 2>/dev/null)"
+	if [ -z "$candidates" ]; then
+		log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube Search :: $lidarrReleaseTitle :: ERROR :: No album results"
+		return
+	fi
+	local resultsCount
+	resultsCount="$(echo "$candidates" | wc -l)"
+	log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube Search :: $lidarrReleaseTitle :: $resultsCount search results found"
+
+	local line ytTitle ytId ytUrl ytCount ytTitleClean diff listId resolveJson
+	while IFS= read -r line; do
+		[ -z "$line" ] && continue
+		ytTitle="$(jq -r '.title // empty' <<<"$line")"
+		[ -z "$ytTitle" ] && continue
+		ytId="$(jq -r '.id // empty' <<<"$line")"
+		ytUrl="$(jq -r '.url // empty' <<<"$line")"
+		ytCount="$(jq -r '.count // 0' <<<"$line")"
+
+		listId="$(echo "${ytUrl}${ytId}" | grep -oE 'OLAK5uy_[A-Za-z0-9_-]+|MPREb_[A-Za-z0-9_-]+' | head -n1)"
+		[ -z "$listId" ] && listId="$(echo "$ytId" | sed 's/[^A-Za-z0-9_-]//g')"
+		[ -z "$listId" ] && continue
+
+		ytTitleClean="$(echo "$ytTitle" | sed -e "s%[^[:alpha:][:digit:]]%%g" -e "s/  */ /g" | sed 's/^[.]*//' | sed 's/[.]*$//g' | sed 's/^ *//g' | sed 's/ *$//g')"
+		ytTitleClean="${ytTitleClean:0:130}"
+
+		diff=$(python -c "from pyxdameraulevenshtein import damerau_levenshtein_distance; print(damerau_levenshtein_distance(\"${lidarrAlbumReleaseTitleClean,,}\", \"${ytTitleClean,,}\"))" 2>/dev/null)
+		[ -z "$diff" ] && continue
+		if [ "$diff" -gt "$matchDistance" ]; then
+			log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube Search :: $lidarrReleaseTitle :: $lidarrAlbumReleaseTitleClean vs $ytTitleClean :: No Match (diff $diff > $matchDistance)"
+			continue
+		fi
+
+		if [ -z "$ytCount" ] || ! [ "$ytCount" -gt 0 ] 2>/dev/null; then
+			resolveJson="$(timeout "$downloadClientTimeOut" yt-dlp -J --flat-playlist --no-warnings "${ytdlpProxyArgs[@]}" "${ytdlpCookieArgs[@]}" "https://music.youtube.com/playlist?list=${listId}" 2>>"/config/logs/$logFileName")"
+			ytCount="$(jq -r '(.entries | length) // 0' <<<"$resolveJson" 2>/dev/null)"
+		fi
+		if [ -z "$ytCount" ] || ! [ "$ytCount" -gt 0 ] 2>/dev/null; then
+			log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube Search :: $lidarrReleaseTitle :: $ytTitleClean :: ERROR :: Could not determine track count, skipping"
+			continue
+		fi
+		if [ "$ytCount" -gt "$lidarrAlbumReleasesMaxTrackCount" ] || [ "$ytCount" -lt "$lidarrAlbumReleasesMinTrackCount" ]; then
+			log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube Search :: $lidarrReleaseTitle :: $ytTitleClean :: Track count $ytCount outside $lidarrAlbumReleasesMinTrackCount-$lidarrAlbumReleasesMaxTrackCount, skipping"
+			continue
+		fi
+
+		log "$proc :: $lidarrArtistName :: $lidarrAlbumTitle :: $lidarrAlbumType :: YouTube Search :: $lidarrReleaseTitle :: $lidarrAlbumReleaseTitleClean vs $ytTitleClean :: YouTube MATCH Found :: diff $diff :: list=$listId ($ytCount tracks)"
+		DownloadProcess "$listId" "YOUTUBE" "$lidarrAlbumReleaseYear" "$ytTitle" "$ytCount"
+
+		if [ "$lidarrDownloadImportNotfication" == "true" ]; then
+			break
+		fi
+	done <<< "$candidates"
 }
 
 LidarrTaskStatusCheck () {
@@ -1790,24 +2208,28 @@ AudioProcess () {
   
   DownloadFormat
   
-  if [ "$dlClientSource" == "deezer" ] || [ "$dlClientSource" == "both" ]; then
+  if clientEnabled deezer; then
   	DeemixClientSetup
   fi
-  
-  if [ "$dlClientSource" == "tidal" ] || [ "$dlClientSource" == "both" ]; then
+
+  if clientEnabled tidal; then
   	TidalClientSetup
   fi
-  
+
+  if clientEnabled youtube; then
+  	YoutubeClientSetup
+  fi
+
   LidarrTaskStatusCheck
-  
+
   # Get artist list for LidarrMissingAlbumSearch process, to prevent searching for artists that will not be processed by the script
   lidarrMissingAlbumArtistsData=$(wget --timeout=0 -q -O - "$arrUrl/api/v1/artist?apikey=$arrApiKey" | jq -r .[])
-  
-  if [ "$dlClientSource" == "deezer" ] || [ "$dlClientSource" == "tidal" ] || [ "$dlClientSource" == "both" ]; then
+
+  if [ ${#dlClients[@]} -ge 1 ]; then
   	GetMissingCutOffList
   else
   	log "ERROR :: No valid dlClientSource set"
-  	log "ERROR :: Expected configuration :: deezer or tidal or both"
+  	log "ERROR :: Expected any of: deezer tidal youtube both (space or comma separated)"
   	log "ERROR :: dlClientSource set as: \"$dlClientSource\""
   fi
   
