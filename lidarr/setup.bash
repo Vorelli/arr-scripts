@@ -1,5 +1,5 @@
 #!/usr/bin/with-contenv bash
-scriptVersion="1.4.9"
+scriptVersion="1.5.0"
 SMA_PATH="/usr/local/sma"
 
 if [ -f /config/setup_version.txt ]; then
@@ -54,8 +54,7 @@ uv pip install --system --upgrade --no-cache-dir --break-system-packages \
   r128gain \
   deemix \
   langdetect \
-  apprise \
-  tidaler && \
+  apprise && \
 echo "************ setup SMA ************"
 if [ -d "${SMA_PATH}"  ]; then
   rm -rf "${SMA_PATH}"
@@ -68,6 +67,9 @@ chgrp users ${SMA_PATH}/config/sma.log && \
 chmod g+w ${SMA_PATH}/config/sma.log && \
 echo "************ install pip dependencies ************" && \
 uv pip install --system --break-system-packages -r ${SMA_PATH}/setup/requirements.txt
+
+echo "************ install tidaler (isolated venv -- its python-ffmpeg dep collides with ffmpeg-python in the shared env) ************" && \
+UV_TOOL_BIN_DIR=/usr/local/bin uv tool install --force tidaler || echo "WARNING :: tidaler install failed -- Tidal client will be unavailable this run"
 
 mkdir -p /custom-services.d/python /config/extended
 
@@ -90,31 +92,31 @@ parallel ::: \
 
 if [ ! -f /config/extended/beets-config.yaml ]; then
 	echo "Download Beets config..."
-	curl -sfL "https://raw.githubusercontent.com/samhaswon/arr-scripts/main/lidarr/beets-config.yaml" -o /config/extended/beets-config.yaml
+	curl -sfL "https://raw.githubusercontent.com/Vorelli/arr-scripts/main/lidarr/beets-config.yaml" -o /config/extended/beets-config.yaml
 	echo "Done"
 fi
 
 if [ ! -f /config/extended/beets-config-lidarr.yaml ]; then
 	echo "Download Beets lidarr config..."
-	curl -sfL "https://raw.githubusercontent.com/samhaswon/arr-scripts/main/lidarr/beets-config-lidarr.yaml" -o /config/extended/beets-config-lidarr.yaml
+	curl -sfL "https://raw.githubusercontent.com/Vorelli/arr-scripts/main/lidarr/beets-config-lidarr.yaml" -o /config/extended/beets-config-lidarr.yaml
 	echo "Done"
 fi
 
 if [ ! -f /config/extended/deemix_config.json ]; then
   echo "Download Deemix config..."
-  curl -sfL "https://raw.githubusercontent.com/samhaswon/arr-scripts/main/lidarr/deemix_config.json" -o /config/extended/deemix_config.json
+  curl -sfL "https://raw.githubusercontent.com/Vorelli/arr-scripts/main/lidarr/deemix_config.json" -o /config/extended/deemix_config.json
   echo "Done"
 fi
 
 if [ ! -f /config/extended/tidaler.json ]; then
   echo "Download Tidal (tidaler) config..."
-  curl -sfL "https://raw.githubusercontent.com/samhaswon/arr-scripts/main/lidarr/tidaler.json" -o /config/extended/tidaler.json
+  curl -sfL "https://raw.githubusercontent.com/Vorelli/arr-scripts/main/lidarr/tidaler.json" -o /config/extended/tidaler.json
   echo "Done"
 fi
 
 if [ ! -f /config/extended/beets-genre-whitelist.txt ]; then
 	echo "Download beets-genre-whitelist.txt..."
-	curl -sfL https://raw.githubusercontent.com/samhaswon/arr-scripts/main/lidarr/beets-genre-whitelist.txt -o /config/extended/beets-genre-whitelist.txt
+	curl -sfL https://raw.githubusercontent.com/Vorelli/arr-scripts/main/lidarr/beets-genre-whitelist.txt -o /config/extended/beets-genre-whitelist.txt
 	echo "Done"
 fi
 
