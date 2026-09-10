@@ -1,4 +1,4 @@
-plugins: chroma embedart lastgenre lyrics
+plugins: musicbrainz chroma embedart lastgenre lyrics
 art_filename: folder
 threaded: yes
 per_disc_numbering: yes
@@ -17,8 +17,9 @@ match:
     max_rec:
         missing_tracks: medium # medium
         unmatched_tracks: medium # medium
-        track_length: medium
-        track_index: medium
+        # Do not add per-track penalties (track_length, track_index) here. A single
+        # track tripping one caps the whole album at `medium`, and quiet mode
+        # (`beet import -q`) only auto-applies a `strong` recommendation.
     distance_weights:
         source: 2.0 # 2.0
         artist: 3.0 # 3.0
@@ -43,7 +44,8 @@ match:
         countries: [] # []
         media: [] # []
         original_year: no # no
-    ignored: ['missing_tracks', 'track_length', 'unmatched_tracks', 'track_index'] # []
+    # Album-level penalties only; per-track ones aggregate into `tracks` and are never seen here
+    ignored: ['missing_tracks', 'unmatched_tracks'] # []
     required: [] # []
     ignored_media: [] # []
     ignore_data_tracks: yes # yes

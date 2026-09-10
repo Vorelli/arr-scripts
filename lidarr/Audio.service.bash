@@ -248,10 +248,20 @@ Configuration () {
 	if [ $enableBeetsTagging = true ]; then
 		log "Beets Tagging Enabled"
 		log "Beets Matching Threshold ${beetsMatchPercentage}%"
-		beetsMatchPercentage=$(expr 100 - $beetsMatchPercentage )
-		if cat /config/extended/beets-config.yaml | grep "strong_rec_thresh: 0.04" | read; then
-			log "Configuring Beets Matching Threshold"
-			sed -i "s/strong_rec_thresh: 0.04/strong_rec_thresh: 0.${beetsMatchPercentage}/g" /config/extended/beets-config.yaml
+		# strong_rec_thresh is a max distance, i.e. the inverse of the match percentage.
+		# Zero-pad so 95% becomes 0.05 and not 0.5
+		if [ "$beetsMatchPercentage" -lt 1 ]; then
+			beetsMatchPercentage=1
+		fi
+		if [ "$beetsMatchPercentage" -gt 100 ]; then
+			beetsMatchPercentage=100
+		fi
+		printf -v beetsMatchDistance "0.%02d" "$(( 100 - beetsMatchPercentage ))"
+		# Match whatever value is currently in the file, not a hard-coded default,
+		# so this keeps working after the shipped default changes or we run again
+		if ! grep -q "strong_rec_thresh: ${beetsMatchDistance}" /config/extended/beets-config.yaml; then
+			log "Configuring Beets Matching Threshold ($beetsMatchDistance)"
+			sed -i "s/strong_rec_thresh: [0-9.]*/strong_rec_thresh: ${beetsMatchDistance}/" /config/extended/beets-config.yaml
 		fi
 	else
 		log "Beets Tagging Disabled"
