@@ -1645,61 +1645,64 @@ SearchProcess () {
 	      				fi
 				fi
 
-				# Skip Various Artists album search that is not supported...
-				if [ "$lidarrArtistForeignArtistId" != "89ad4ac3-39f7-470e-963a-56509c546377" ]; then
-
-					#log "1 : $lidarrDownloadImportNotfication"				
-					
-					# Tidal Artist search
-					if [ "$lidarrDownloadImportNotfication" == "false" ]; then
-						if [ "$skipTidal" == "false" ]; then
-							for tidalArtistId in $(echo $tidalArtistIds); do
-								ArtistTidalSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$tidalArtistId" "$lyricFilter"
-								sleep 0.01
-							done
+				# Search every configured client at one stage before moving to the next:
+				# an exact artist-id match on the second client still beats a fuzzy title
+				# match on the first, so the stage is the outer loop, not the client.
+				#
+				# Client order is dlClientSource order, via albumClients[] (built above =
+				# configured clients minus any already marked notfound for THIS album).
+				# skipDeezer/skipTidal/skipYoutube were resolved above and additionally
+				# cover the missing-artist-link and youtube-disabled cases.
+				for searchStage in artist fuzzy; do
+					for searchClient in "${albumClients[@]}"; do
+						# Stop as soon as an import has been handed off to Lidarr
+						if [ "$lidarrDownloadImportNotfication" != "false" ]; then
+							break 2
 						fi
-					fi
 
-					#log "2 : $lidarrDownloadImportNotfication"
-
-					# Deezer artist search
-					if [ "$lidarrDownloadImportNotfication" == "false" ]; then
-						if [ "$skipDeezer" == "false" ]; then
-							for dId in ${!deezerArtistIds[@]}; do
-								deezerArtistId="${deezerArtistIds[$dId]}"
-								ArtistDeezerSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$deezerArtistId" "$lyricFilter"
+						case "$searchStage-$searchClient" in
+							artist-tidal)
+								[ "$skipTidal" == "false" ] || continue
+								# Various Artists has no single artist id to search by
+								[ "$lidarrArtistForeignArtistId" != "89ad4ac3-39f7-470e-963a-56509c546377" ] || continue
+								for tidalArtistId in $(echo $tidalArtistIds); do
+									ArtistTidalSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$tidalArtistId" "$lyricFilter"
+									sleep 0.01
+								done
+								;;
+							artist-deezer)
+								[ "$skipDeezer" == "false" ] || continue
+								[ "$lidarrArtistForeignArtistId" != "89ad4ac3-39f7-470e-963a-56509c546377" ] || continue
+								for dId in ${!deezerArtistIds[@]}; do
+									deezerArtistId="${deezerArtistIds[$dId]}"
+									ArtistDeezerSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$deezerArtistId" "$lyricFilter"
+									sleep 0.01
+								done
+								;;
+							artist-youtube)
+								# youtube has no artist-id lookup, fuzzy stage only
+								continue
+								;;
+							fuzzy-tidal)
+								[ "$skipTidal" == "false" ] || continue
+								FuzzyTidalSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$lyricFilter"
 								sleep 0.01
-							done
-						fi
-					fi
-				fi
-
-				#log "3 : $lidarrDownloadImportNotfication"
-				# Tidal fuzzy search
-				if [ "$lidarrDownloadImportNotfication" == "false" ]; then
-					if [ "$skipTidal" == "false" ]; then
-						FuzzyTidalSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$lyricFilter"
-						sleep 0.01
-					fi
-				fi
-
-				#log "4 : $lidarrDownloadImportNotfication"
-				# Deezer fuzzy search
-				if [ "$lidarrDownloadImportNotfication" == "false" ]; then
-					if [ "$skipDeezer" == "false" ]; then
-						FuzzyDeezerSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$lyricFilter"
-						sleep 0.01
-					fi
-				fi
-
-				#log "5 : $lidarrDownloadImportNotfication"
-				# YouTube (YouTube Music) search -- one pass only, no lyric filter
-				if [ "$lidarrDownloadImportNotfication" == "false" ] && [ "$loopCount" == "1" ]; then
-					if [ "$skipYoutube" == "false" ]; then
-						YoutubeSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal"
-						sleep 0.01
-					fi
-				fi
+								;;
+							fuzzy-deezer)
+								[ "$skipDeezer" == "false" ] || continue
+								FuzzyDeezerSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal" "$lyricFilter"
+								sleep 0.01
+								;;
+							fuzzy-youtube)
+								[ "$skipYoutube" == "false" ] || continue
+								# one youtube pass per album, on the first lyric loop only
+								[ "$loopCount" == "1" ] || continue
+								YoutubeSearch "$page :: $wantedAlbumListSource :: $processNumber of $wantedListAlbumTotal"
+								sleep 0.01
+								;;
+						esac
+					done
+				done
 
 				# End search if lidarr was successfully notified for import
 				if [ "$lidarrDownloadImportNotfication" == "true" ]; then
